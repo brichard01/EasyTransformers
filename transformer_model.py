@@ -14,13 +14,14 @@ class TransformerArgs:
     n_kv_heads: int = 4
     eps: float = 1e-6
     vocab_size: int = 32000
-    precompute_rotary = 256
+    precompute_rotary: int = 256
+    dtype: torch.dtype = torch.float16
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, args: TransformerArgs, norm=None):
         super().__init__()
         self.eps = args.eps
-        self.weight = nn.Parameter(torch.ones(args.embedding_dim))
+        self.weight = nn.Parameter(torch.ones(args.embedding_dim, dtype=args.dtype))
         if norm is not None:
             self.load(norm)
 
@@ -39,10 +40,10 @@ class Attention(nn.Module):
         self.Hq, self.H = args.n_heads, args.n_kv_heads
         E = args.embedding_dim
         object.__setattr__(self, 'positional_encoder', positional_encoder)
-        self.q_proj = nn.Linear(in_features=E, out_features=self.Hq*args.head_dim, bias=False)
-        self.k_proj = nn.Linear(in_features=E, out_features=self.H*args.head_dim, bias=False)
-        self.v_proj = nn.Linear(in_features=E, out_features=self.H*args.head_dim, bias=False)
-        self.o_proj = nn.Linear(in_features=E, out_features=E, bias=False)
+        self.q_proj = nn.Linear(in_features=E, out_features=self.Hq*args.head_dim, bias=False, dtype=args.dtype)
+        self.k_proj = nn.Linear(in_features=E, out_features=self.H*args.head_dim, bias=False, dtype=args.dtype)
+        self.v_proj = nn.Linear(in_features=E, out_features=self.H*args.head_dim, bias=False, dtype=args.dtype)
+        self.o_proj = nn.Linear(in_features=E, out_features=E, bias=False, dtype=args.dtype)
         if attention is not None:
             self.load(attention)
 
@@ -71,9 +72,9 @@ class Attention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, args: TransformerArgs, mlp=None):
         super().__init__()
-        self.gate_proj = nn.Linear(in_features=args.embedding_dim, out_features=args.exploded_dim, bias=False)
-        self.up_proj = nn.Linear(in_features=args.embedding_dim, out_features=args.exploded_dim, bias=False)
-        self.down_proj = nn.Linear(in_features=args.exploded_dim, out_features=args.embedding_dim, bias=False)
+        self.gate_proj = nn.Linear(in_features=args.embedding_dim, out_features=args.exploded_dim, bias=False, dtype=args.dtype)
+        self.up_proj = nn.Linear(in_features=args.embedding_dim, out_features=args.exploded_dim, bias=False, dtype=args.dtype)
+        self.down_proj = nn.Linear(in_features=args.exploded_dim, out_features=args.embedding_dim, bias=False, dtype=args.dtype)
         self.act_fn = nn.SiLU()
         if mlp is not None:
             self.load(mlp)
@@ -108,12 +109,12 @@ class Transformers(nn.Module):
         if model is not None:
             self.load_from_mistral(model, args)
         else:
-            self.embeddings = nn.Embedding(args.vocab_size, args.embedding_dim)
+            self.embeddings = nn.Embedding(args.vocab_size, args.embedding_dim, dtype=args.dtype)
             self.layers = nn.ModuleList(
                 [Block(args, self.positional_encoder) for _ in range(args.nb_layers)]
             )
             self.norm = RMSNorm(args)
-            self.output = nn.Linear(in_features=args.embedding_dim, out_features=args.vocab_size, bias=False)
+            self.output = nn.Linear(in_features=args.embedding_dim, out_features=args.vocab_size, bias=False, dtype=args.dtype)
 
     def load_from_mistral(self, model, args):
         self.embeddings = model.tok_embeddings
