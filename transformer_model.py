@@ -16,17 +16,21 @@ class TransformerArgs:
     vocab_size: int = 32000
     precompute_rotary: int = 256
     dtype: torch.dtype = torch.float16
+    norm_dtype: torch.dtype = torch.float32
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, args: TransformerArgs, norm=None):
         super().__init__()
         self.eps = args.eps
-        self.weight = nn.Parameter(torch.ones(args.embedding_dim, dtype=args.dtype))
+        self.dtype = args.norm_dtype
+        self.weight = nn.Parameter(
+            torch.ones(args.embedding_dim, dtype=args.dtype)
+        )
         if norm is not None:
             self.load(norm)
 
     def forward(self, x):
-        output = x.float()
+        output = x.to(self.dtype)
         norm = torch.rsqrt(output.pow(2).mean(-1, keepdim=True) + self.eps)
         output = (output*norm).type_as(x)
         return output * self.weight
