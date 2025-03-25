@@ -3,6 +3,35 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torchtune.modules import RotaryPositionalEmbeddings
+from typing import Optional
+
+mistral_mapping = {
+    'q_proj': 'wq',
+    'k_proj': 'wk',
+    'v_proj': 'wv',
+    'o_proj': 'wo',
+    'gate_proj': 'w1',
+    'down_proj': 'w2',
+    'up_proj': 'w3',
+    'attention': 'attention',
+    'feed_forward': 'feed_forward',
+    'attention_norm': 'attention_norm',
+    'ffn_norm': 'ffn_norm',
+}
+
+transformers_mapping = {
+    'q_proj': 'q_proj',
+    'k_proj': 'k_proj',
+    'v_proj': 'v_proj',
+    'o_proj': 'o_proj',
+    'gate_proj': 'gate_proj',
+    'down_proj': 'down_proj',
+    'up_proj': 'up_proj',
+    'attention': 'self_attn',
+    'feed_forward': 'mlp',
+    'attention_norm': 'input_layernorm',
+    'ffn_norm': 'post_attention_layernorm',
+}
 
 @dataclass
 class TransformerArgs:
@@ -12,16 +41,18 @@ class TransformerArgs:
     exploded_dim: int = 5632
     n_heads: int = 32
     n_kv_heads: int = 4
-    eps: float = 1e-6
     vocab_size: int = 32000
-    precompute_rotary: int = 256
+    max_seq_len: int = 256
+    rope_base: int = 10000
+    pairing_style: Optional[str] = None
     dtype: torch.dtype = torch.float16
     norm_dtype: torch.dtype = torch.float32
+    norm_eps: float = 1e-6
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, args: TransformerArgs, norm=None):
         super().__init__()
-        self.eps = args.eps
+        self.eps = args.norm_eps
         self.dtype = args.norm_dtype
         self.weight = nn.Parameter(
             torch.ones(args.embedding_dim, dtype=args.dtype)
@@ -38,8 +69,25 @@ class RMSNorm(torch.nn.Module):
     def load(self, norm):
         self.weight = norm.weight
 
+class RoPE(RotaryPositionalEmbeddings):
+    def __init__(self, args, pairing_style='mistral_inf'):
+        super().__init__(args.head_dim, args.max_seq_len, args.rope_base)
+        self.pairing_style = args.pairing_style
+        if self.pairing_style is None:
+            self.pairing_style = pairing_style
+
+    def forward(self, x: torch.Tensor, input_pos: Optional[torch.Tensor] = None):
+        if self.pairing_style == 'mistral_inf':
+            x = super().forward(x, input_pos=input_pos)
+        else:
+            shape = x.shape
+            x = torch.stack(torch.split(x, shape[-1]//2, dim=-1), dim=-1).view(*shape)
+            x = super().forward(x, input_pos=input_pos)
+            x = x.view(*shape[:-1], -1, 2).transpose(3, 4).reshape(shape)
+        return x
+
 class Attention(nn.Module):
-    def __init__(self, args: TransformerArgs, positional_encoder, attention=None):
+    def __init__(self, args: TransformerArgs, positional_encoder, attention=None, mapping=None):
         super().__init__()
         self.Hq, self.H = args.n_heads, args.n_kv_heads
         E = args.embedding_dim
@@ -49,7 +97,7 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(in_features=E, out_features=self.H*args.head_dim, bias=False, dtype=args.dtype)
         self.o_proj = nn.Linear(in_features=E, out_features=E, bias=False, dtype=args.dtype)
         if attention is not None:
-            self.load(attention)
+            self.load(attention, mapping)
 
     def forward(self, x):
         N, S, E = x.shape
@@ -67,37 +115,44 @@ class Attention(nn.Module):
         )
         return self.o_proj(attention.transpose(1, 2).contiguous().view(N, S, E))
     
-    def load(self, attention):
-        self.q_proj.weight = attention.wq.weight
-        self.k_proj.weight = attention.wk.weight
-        self.v_proj.weight = attention.wv.weight
-        self.o_proj.weight = attention.wo.weight
+    def load(self, attention, mapping):
+        self.q_proj.weight = getattr(attention, mapping['q_proj']).weight
+        self.k_proj.weight = getattr(attention, mapping['k_proj']).weight
+        self.v_proj.weight = getattr(attention, mapping['v_proj']).weight
+        self.o_proj.weight = getattr(attention, mapping['o_proj']).weight
 
 class FeedForward(nn.Module):
-    def __init__(self, args: TransformerArgs, mlp=None):
+    def __init__(self, args: TransformerArgs, mlp=None, mapping=None):
         super().__init__()
         self.gate_proj = nn.Linear(in_features=args.embedding_dim, out_features=args.exploded_dim, bias=False, dtype=args.dtype)
         self.up_proj = nn.Linear(in_features=args.embedding_dim, out_features=args.exploded_dim, bias=False, dtype=args.dtype)
         self.down_proj = nn.Linear(in_features=args.exploded_dim, out_features=args.embedding_dim, bias=False, dtype=args.dtype)
         self.act_fn = nn.SiLU()
         if mlp is not None:
-            self.load(mlp)
+            self.load(mlp, mapping)
 
     def forward(self, x):
         x = self.up_proj(x)*self.act_fn(self.gate_proj(x))
         return self.down_proj(x)
     
-    def load(self, mlp):
-        self.gate_proj.weight = mlp.w1.weight
-        self.up_proj.weight = mlp.w3.weight
-        self.down_proj.weight = mlp.w2.weight
+    def load(self, mlp, mapping):
+        self.gate_proj.weight = getattr(mlp, mapping['gate_proj']).weight
+        self.up_proj.weight = getattr(mlp, mapping['up_proj']).weight
+        self.down_proj.weight = getattr(mlp, mapping['down_proj']).weight
 
 class Block(nn.Module):
-    def __init__(self, args: TransformerArgs, positional_encoder, block=None):
+    def __init__(self, args: TransformerArgs, positional_encoder, block=None, mapping=None):
         super().__init__()
-        attn, ffn, n1, n2 = [None]*4 if block is None else (block.attention, block.feed_forward, block.attention_norm, block.ffn_norm)
-        self.attention = Attention(args, positional_encoder, attn)
-        self.feed_forward = FeedForward(args, ffn)
+        attn, ffn, n1, n2 = [None]*4
+        if block is not None:
+            attn, ffn, n1, n2 = (
+                getattr(block, mapping['attention']),
+                getattr(block, mapping['feed_forward']),
+                getattr(block, mapping['attention_norm']),
+                getattr(block, mapping['ffn_norm']),
+            )
+        self.attention = Attention(args, positional_encoder, attn, mapping=mapping)
+        self.feed_forward = FeedForward(args, ffn, mapping=mapping)
         self.attention_norm = RMSNorm(args, n1)
         self.ffn_norm = RMSNorm(args, n2)
 
@@ -109,7 +164,8 @@ class Block(nn.Module):
 class Transformers(nn.Module):
     def __init__(self, args: TransformerArgs, model=None):
         super().__init__()
-        self.positional_encoder = RotaryPositionalEmbeddings(args.head_dim, args.precompute_rotary)
+        self.args = args
+        self.positional_encoder = RoPE(args)
         if model is not None:
             self.load_from_mistral(model, args)
         else:
@@ -123,13 +179,24 @@ class Transformers(nn.Module):
     def load_from_mistral(self, model, args):
         self.embeddings = model.tok_embeddings
         self.layers = nn.ModuleList(
-            [Block(args, self.positional_encoder, block) for block in model.layers]
+            [Block(args, self.positional_encoder, block, mapping=mistral_mapping) for block in model.layers]
         )
         self.norm = RMSNorm(args, norm=model.norm)
         self.output = model.output
+
+    def load_from_transformers(self, llm, args):
+        self.positional_encoder.pairing_style = 'transformers'
+        model = llm.model
+        self.embeddings = model.embed_tokens
+        self.layers = nn.ModuleList(
+            [Block(args, self.positional_encoder, block, mapping=transformers_mapping) for block in model.layers]
+        )
+        self.norm = RMSNorm(args, norm=model.norm)
+        self.output = llm.lm_head
 
     def forward(self, input_ids):
         x = self.embeddings(input_ids)
         for layer in self.layers:
             x = layer(x)
         return self.output(self.norm(x))
+    
