@@ -200,3 +200,19 @@ class Transformers(nn.Module):
             x = layer(x)
         return self.output(self.norm(x))
     
+    def generate_step(self, input_ids, temperature=1, top_k=10):
+        N, _ = input_ids.shape
+        x = self.embeddings(input_ids)
+        for layer in self.layers:
+            x = layer(x)
+        x = x[:, -1, :]
+        logits = self.output(self.norm(x))
+        probs = F.softmax(logits/temperature, dim=-1)
+        probs, ids = torch.topk(probs, k=top_k)
+        probs = (probs / probs.sum(dim=-1).view(N, 1)).cumsum(dim=-1)
+        p = torch.rand(N, device=input_ids.device).view(N, 1)
+        index = top_k-(p<probs).sum(-1)
+        new_ids = torch.Tensor([ids[i, id] for i, id in enumerate(index)]).view(N, 1)
+        return torch.cat((input_ids, new_ids.to(input_ids.device, dtype=input_ids.dtype)), dim=-1)
+
+
