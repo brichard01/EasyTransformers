@@ -251,27 +251,47 @@ class Transformers(nn.Module):
                 self.args.dtype,
             )
 
-    def step_cache(self, input_ids):
-        x = self.embeddings(input_ids)
-        for layer in self.layers:
-            x = layer.forward_cache(x)
-        x = x[:, -1, :]
-        logits = self.output(self.norm(x))
-        return logits
     
-    def generate_step(self, input_ids, temperature=1, top_k=10):
+    def generate_step(self, input_ids, temperature=1, top_k=10, use_cache=True, eps=1e-3):
         N, _ = input_ids.shape
         x = self.embeddings(input_ids)
         for layer in self.layers:
-            x = layer(x)
+            if use_cache:
+                x = layer.forward_cache(x)
+            else:
+                x = layer(x)
         x = x[:, -1, :]
         logits = self.output(self.norm(x))
-        probs = F.softmax(logits/temperature, dim=-1)
-        probs, ids = torch.topk(probs, k=top_k)
-        probs = (probs / probs.sum(dim=-1).view(N, 1)).cumsum(dim=-1)
-        p = torch.rand(N, device=input_ids.device).view(N, 1)
-        index = top_k-(p<probs).sum(-1)
-        new_ids = torch.Tensor([ids[i, id] for i, id in enumerate(index)]).view(N, 1)
-        return torch.cat((input_ids, new_ids.to(input_ids.device, dtype=input_ids.dtype)), dim=-1)
+        if temperature < eps:
+            new_ids = torch.argmax(logits, dim=-1).view(N, 1)
+        else:
+            probs = F.softmax(logits/temperature, dim=-1)
+            probs, ids = torch.topk(probs, k=top_k)
+            probs = (probs / probs.sum(dim=-1).view(N, 1)).cumsum(dim=-1)
+            p = torch.rand(N, device=input_ids.device).view(N, 1)
+            index = top_k-(p<probs).sum(-1)
+            new_ids = torch.Tensor([ids[i, id] for i, id in enumerate(index)]).view(N, 1)
+        return new_ids
 
+
+    def generate(self, input_ids, nb_steps, temperature=1, top_k=10, use_cache=True, eps=1e-3):
+        input_size = input_ids.shape[-1]
+        if use_cache:
+            self.init_kv_cache()
+            context, input_ids = input_ids.split(input_ids.shape[1]-1, 1)
+            self.forward(context)
+            res = []
+        for _ in range(nb_steps):
+            new_ids = self.generate_step(input_ids, temperature, top_k, use_cache, eps)
+            new_ids = new_ids.to(input_ids.device, dtype=input_ids.dtype)
+            if use_cache:
+                res.append(new_ids)
+                input_ids = new_ids
+            else:
+                input_ids = torch.cat((input_ids, new_ids), dim=-1)
+        if use_cache:
+            return torch.cat(res, dim=-1)
+        else:
+            return input_ids[:, input_size:]
+        
 
