@@ -48,14 +48,16 @@ class TransformerArgs:
     dtype: torch.dtype = torch.float16
     norm_dtype: torch.dtype = torch.float32
     norm_eps: float = 1e-6
+    qk_norm: bool = False
 
 class RMSNorm(torch.nn.Module):
-    def __init__(self, args: TransformerArgs, norm=None):
+    def __init__(self, args: TransformerArgs, norm=None, size=None):
         super().__init__()
         self.eps = args.norm_eps
         self.dtype = args.norm_dtype
+        size = size if size else args.embedding_dim
         self.weight = nn.Parameter(
-            torch.ones(args.embedding_dim, dtype=args.dtype)
+            torch.ones(size, dtype=args.dtype)
         )
         if norm is not None:
             self.load(norm)
@@ -95,7 +97,12 @@ class Attention(nn.Module):
         self.q_proj = nn.Linear(in_features=E, out_features=self.Hq*args.head_dim, bias=False, dtype=args.dtype)
         self.k_proj = nn.Linear(in_features=E, out_features=self.H*args.head_dim, bias=False, dtype=args.dtype)
         self.v_proj = nn.Linear(in_features=E, out_features=self.H*args.head_dim, bias=False, dtype=args.dtype)
-        self.o_proj = nn.Linear(in_features=E, out_features=E, bias=False, dtype=args.dtype)
+        self.o_proj = nn.Linear(in_features=self.Hq*args.head_dim, out_features=E, bias=False, dtype=args.dtype)
+        self.q_norm = None
+        self.k_norm = None
+        if args.qk_norm:
+            self.q_norm = RMSNorm(args, size=args.head_dim)
+            self.k_norm = RMSNorm(args, size=args.head_dim)
         if attention is not None:
             self.load(attention, mapping)
         self.cache = None
@@ -105,6 +112,9 @@ class Attention(nn.Module):
         xq = self.q_proj(x).view(N, S, self.Hq, -1)
         xk = self.k_proj(x).view(N, S, self.H, -1)
         xv = self.v_proj(x).view(N, S, self.H, -1)
+        if self.q_norm:
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
         xq = self.positional_encoder(xq)
         xk = self.positional_encoder(xk)
         if self.cache:
@@ -116,13 +126,16 @@ class Attention(nn.Module):
             enable_gqa=True,
             is_causal=True,
         )
-        return self.o_proj(attention.transpose(1, 2).contiguous().view(N, S, E))
+        return self.o_proj(attention.transpose(1, 2).contiguous().view(N, S, -1))
     
     def forward_cache(self, x):
         N, S, E = x.shape
         xq = self.q_proj(x).view(N, S, self.Hq, -1)
         xk = self.k_proj(x).view(N, S, self.H, -1)
         xv = self.v_proj(x).view(N, S, self.H, -1)
+        if self.q_norm:
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
         position = self.cache.v.shape[1]
         position = torch.tensor([position], dtype=torch.int64)
         xq = self.positional_encoder(xq, position)
@@ -135,13 +148,16 @@ class Attention(nn.Module):
             enable_gqa=True,
             is_causal=False,
         )
-        return self.o_proj(attention.transpose(1, 2).contiguous().view(N, S, E))
+        return self.o_proj(attention.transpose(1, 2).contiguous().view(N, S, -1))
     
     def load(self, attention, mapping):
         self.q_proj.weight = getattr(attention, mapping['q_proj']).weight
         self.k_proj.weight = getattr(attention, mapping['k_proj']).weight
         self.v_proj.weight = getattr(attention, mapping['v_proj']).weight
         self.o_proj.weight = getattr(attention, mapping['o_proj']).weight
+        if self.k_norm:
+            self.q_norm.weight = attention.q_norm.weight
+            self.k_norm.weight = attention.k_norm.weight
 
 class FeedForward(nn.Module):
     def __init__(self, args: TransformerArgs, mlp=None, mapping=None):
