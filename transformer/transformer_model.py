@@ -98,6 +98,7 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(in_features=E, out_features=E, bias=False, dtype=args.dtype)
         if attention is not None:
             self.load(attention, mapping)
+        self.cache = None
 
     def forward(self, x):
         N, S, E = x.shape
@@ -106,12 +107,33 @@ class Attention(nn.Module):
         xv = self.v_proj(x).view(N, S, self.H, -1)
         xq = self.positional_encoder(xq)
         xk = self.positional_encoder(xk)
+        if self.cache:
+            self.cache(xk, xv)
         attention = F.scaled_dot_product_attention(
             xq.transpose(1, 2),
             xk.transpose(1, 2),
             xv.transpose(1, 2),
             enable_gqa=True,
             is_causal=True,
+        )
+        return self.o_proj(attention.transpose(1, 2).contiguous().view(N, S, E))
+    
+    def forward_cache(self, x):
+        N, S, E = x.shape
+        xq = self.q_proj(x).view(N, S, self.Hq, -1)
+        xk = self.k_proj(x).view(N, S, self.H, -1)
+        xv = self.v_proj(x).view(N, S, self.H, -1)
+        position = self.cache.v.shape[1]
+        position = torch.tensor([position], dtype=torch.int64)
+        xq = self.positional_encoder(xq, position)
+        xk = self.positional_encoder(xk, position)
+        xk, xv = self.cache(xk, xv)
+        attention = F.scaled_dot_product_attention(
+            xq.transpose(1, 2),
+            xk.transpose(1, 2),
+            xv.transpose(1, 2),
+            enable_gqa=True,
+            is_causal=False,
         )
         return self.o_proj(attention.transpose(1, 2).contiguous().view(N, S, E))
     
@@ -160,6 +182,27 @@ class Block(nn.Module):
         x = x + self.attention(self.attention_norm(x))
         x = x + self.feed_forward(self.ffn_norm(x))
         return x
+    
+    def forward_cache(self, x):
+        x = x + self.attention.forward_cache(self.attention_norm(x))
+        x = x + self.feed_forward(self.ffn_norm(x))
+        return x
+    
+class kv_cache:
+    def __init__(self, heads, head_dim, dtype=torch.float16):
+        self.heads = heads
+        self.head_dim = head_dim
+        self.dtype = dtype
+        self.resest()   
+
+    def resest(self):
+        self.k = torch.zeros(1, 0, self.heads, self.head_dim, dtype=self.dtype)
+        self.v = torch.zeros(1, 0, self.heads, self.head_dim, dtype=self.dtype)
+
+    def __call__(self, xk, xv):
+        self.k = torch.cat([self.k, xk], 1)
+        self.v = torch.cat([self.v, xv], 1)
+        return self.k, self.v
 
 class Transformers(nn.Module):
     def __init__(self, args: TransformerArgs, model=None):
@@ -199,6 +242,22 @@ class Transformers(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return self.output(self.norm(x))
+    
+    def init_kv_cache(self):
+        for layer in self.layers:
+            layer.attention.cache = kv_cache(
+                self.args.n_kv_heads,
+                self.args.head_dim,
+                self.args.dtype,
+            )
+
+    def step_cache(self, input_ids):
+        x = self.embeddings(input_ids)
+        for layer in self.layers:
+            x = layer.forward_cache(x)
+        x = x[:, -1, :]
+        logits = self.output(self.norm(x))
+        return logits
     
     def generate_step(self, input_ids, temperature=1, top_k=10):
         N, _ = input_ids.shape
